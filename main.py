@@ -60,9 +60,7 @@ async def lifespan(app: FastAPI):
         if database is not None:
             try:
                 await database.products.create_index("name")
-                await database.products.create_index("category")
-                await database.products.create_index("brand")
-                await database.products.create_index("attributes.size")
+                await database.products.create_index("size")  # Changed to match HROne spec
                 await database.orders.create_index("user_id")
                 await database.orders.create_index("created_at")
                 await database.orders.create_index([("user_id", 1), ("created_at", -1)])
@@ -93,27 +91,227 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Pydantic models for request/response validation
+# HROne Task Specific Pydantic Models
+
+class CreateProductRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200, description="Product name")
+    price: float = Field(..., gt=0, description="Product price (must be positive)")
+    size: str = Field(..., min_length=1, max_length=50, description="Product size")
+    description: Optional[str] = Field(None, description="Product description")
+
+class OrderItem(BaseModel):
+    product_id: str = Field(..., description="Product ID")
+    quantity: int = Field(..., gt=0, le=100, description="Quantity ordered (max 100)")
+    
+    @validator('product_id')
+    def validate_product_id(cls, v):
+        if not ObjectId.is_valid(v):
+            raise ValueError('Invalid product ID format')
+        return v
+
+class CreateOrderRequest(BaseModel):
+    user_id: str = Field(..., min_length=1, description="User ID placing the order")
+    items: List[OrderItem] = Field(..., min_items=1, max_items=50, description="List of items in the order")
+
+# Helper functions
+def serialize_doc(doc):
+    """Convert ObjectId to string for JSON serialization"""
+    if doc is None:
+        return None
+    doc["_id"] = str(doc["_id"])
+    return doc
+
+async def get_database():
+    """Dependency to get database instance"""
+    if database is None:
+        raise HTTPException(status_code=503, detail="Database connection not available. Please check your MongoDB connection.")
+    return database
+
+# API Endpoints
+
+@app.get("/", tags=["Root"])
+async def root():
+    """Root endpoint - Always accessible"""
+    return {
+        "message": "Welcome to Ecommerce API", 
+        "version": "1.0.0",
+        "docs": "/docs",
+        "health": "/health",
+        "status": "running",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+@app.get("/health", tags=["Health"])
+async def health_check():
+    """Health check endpoint - Always accessible"""
+    try:
+        # Test database connection
+        if database is not None:
+            await database.command('ping')
+            db_status = "connected"
+        else:
+            db_status = "disconnected"
+    except Exception as e:
+        db_status = f"error: {str(e)}"
+    
+    return {
+        "status": "healthy",
+        "database": db_status,
+        "timestamp": datetime.utcnow().isoformat(),
+        "version": "1.0.0"
+    }
+
+# HROne Task Required Endpoints
+
+@app.post("/products", status_code=201, tags=["Products"])
+async def create_product(product: CreateProductRequest, db=Depends(get_database)):
+    """Create a new product - HROne Task Specification"""
+    try:
+        product_doc = {
+            "name": product.name,
+            "price": product.price,
+            "size": product.size,
+            "description": product.description,
+            "created_at": datetime.utcnow()
+        }
+        
+        result = await db.products.insert_one(product_doc)
+        
+        # Fetch the created product
+        created_product = await db.products.find_one({"_id": result.inserted_id})
+        
+        logger.info(f"Product created: {created_product['name']} (ID: {result.inserted_id})")
+        return serialize_doc(created_product)
+        
+    except Exception as e:
+        logger.error(f"Failed to create product: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to create product: {str(e)}")
+
+@app.get("/products", status_code=200, tags=["Products"])
+async def list_products(
+    name: Optional[str] = Query(None, description="Filter by product name (supports partial matching)"),
+    size: Optional[str] = Query(None, description="Filter by size"),
+    limit: int = Query(10, ge=1, le=100, description="Number of products to return"),
+    offset: int = Query(0, ge=0, description="Number of products to skip"),
+    db=Depends(get_database)
+):
+    """List products with optional filtering and pagination - HROne Task Specification"""
+    try:
+        # Build filter query
+        filter_query = {}
+        
+        if name:
+            filter_query["name"] = {"$regex": re.escape(name), "$options": "i"}
+        
+        if size:
+            filter_query["size"] = size
+        
+        # Get total count for pagination info
+        total_count = await db.products.count_documents(filter_query)
+        
+        # Fetch products with pagination (sorted by _id for consistent pagination)
+        cursor = db.products.find(filter_query).sort("_id", 1).skip(offset).limit(limit)
+        products = await cursor.to_list(length=limit)
+        
+        # Serialize products
+        serialized_products = [serialize_doc(product) for product in products]
+        
+        return {
+            "products": serialized_products,
+            "total": total_count,
+            "limit": limit,
+            "previous": offset
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to fetch products: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch products: {str(e)}")
+
+@app.post("/orders", status_code=201, tags=["Orders"])
+async def create_order(order: CreateOrderRequest, db=Depends(get_database)):
+    """Create a new order - HROne Task Specification"""
+    try:
+        # Validate products exist and calculate total
+        total_amount = 0.0
+        order_items = []
+        
+        for item in order.items:
+            # Verify product exists
+            if not ObjectId.is_valid(item.product_id):
+                raise HTTPException(status_code=400, detail=f"Invalid product ID format: {item.product_id}")
+            
+            product = await db.products.find_one({"_id": ObjectId(item.product_id)})
+            if not product:
+                raise HTTPException(status_code=404, detail=f"Product not found: {item.product_id}")
+            
+            item_total = product["price"] * item.quantity
+            total_amount += item_total
+            
+            order_items.append({
+                "product_id": item.product_id,
+                "quantity": item.quantity
+            })
+        
+        # Create order document
+        order_doc = {
+            "user_id": order.user_id,
+            "items": order_items,
+            "total_amount": total_amount,
+            "created_at": datetime.utcnow()
+        }
+        
+        result = await db.orders.insert_one(order_doc)
+        
+        # Fetch the created order
+        created_order = await db.orders.find_one({"_id": result.inserted_id})
+        
+        logger.info(f"Order created: {result.inserted_id} for user {order.user_id}")
+        return serialize_doc(created_order)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to create order: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to create order: {str(e)}")
+
+@app.get("/orders/{user_id}", status_code=200, tags=["Orders"])
+async def get_user_orders(
+    user_id: str,
+    limit: int = Query(10, ge=1, le=100, description="Number of orders to return"),
+    offset: int = Query(0, ge=0, description="Number of orders to skip"),
+    db=Depends(get_database)
+):
+    """Get list of orders for a specific user - HROne Task Specification"""
+    try:
+        filter_query = {"user_id": user_id}
+        
+        # Get total count for pagination info
+        total_count = await db.orders.count_documents(filter_query)
+        
+        # Fetch orders with pagination (sorted by _id for consistent pagination)
+        cursor = db.orders.find(filter_query).sort("_id", 1).skip(offset).limit(limit)
+        orders = await cursor.to_list(length=limit)
+        
+        # Serialize orders
+        serialized_orders = [serialize_doc(order) for order in orders]
+        
+        return {
+            "orders": serialized_orders,
+            "total": total_count,
+            "limit": limit,
+            "offset": offset,
+            "user_id": user_id
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to fetch orders for user {user_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch orders: {str(e)}")
+
+# Additional endpoints from your original file (kept for completeness but not required by HROne task)
 
 class ProductAttribute(BaseModel):
     name: str = Field(..., min_length=1, description="Attribute name")
     value: str = Field(..., min_length=1, description="Attribute value")
-
-class CreateProductRequest(BaseModel):
-    name: str = Field(..., min_length=1, max_length=200, description="Product name")
-    description: str = Field(..., min_length=10, max_length=2000, description="Product description")
-    price: float = Field(..., gt=0, description="Product price (must be positive)")
-    category: str = Field(..., min_length=1, max_length=100, description="Product category")
-    brand: str = Field(..., min_length=1, max_length=100, description="Product brand")
-    attributes: List[ProductAttribute] = Field(default=[], description="Product attributes like size, color, etc.")
-    stock_quantity: int = Field(..., ge=0, description="Available stock quantity")
-    images: List[str] = Field(default=[], description="List of image URLs")
-    
-    @validator('images')
-    def validate_images(cls, v):
-        if len(v) > 10:  # Limit to 10 images
-            raise ValueError('Maximum 10 images allowed')
-        return v
 
 class UpdateProductRequest(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=200)
@@ -147,38 +345,6 @@ class ProductsListResponse(BaseModel):
     limit: int
     offset: int
     has_more: bool
-
-class OrderItem(BaseModel):
-    product_id: str = Field(..., description="Product ID")
-    quantity: int = Field(..., gt=0, le=100, description="Quantity ordered (max 100)")
-    price_per_item: Optional[float] = Field(None, gt=0, description="Price per item (auto-filled if not provided)")
-    
-    @validator('product_id')
-    def validate_product_id(cls, v):
-        if not ObjectId.is_valid(v):
-            raise ValueError('Invalid product ID format')
-        return v
-
-class CreateOrderRequest(BaseModel):
-    user_id: str = Field(..., min_length=1, description="User ID placing the order")
-    items: List[OrderItem] = Field(..., min_items=1, max_items=50, description="List of items in the order")
-    shipping_address: Dict[str, Any] = Field(..., description="Shipping address details")
-    payment_method: str = Field(..., description="Payment method used")
-    
-    @validator('shipping_address')
-    def validate_shipping_address(cls, v):
-        required_fields = ['street', 'city', 'state', 'zip_code', 'country']
-        for field in required_fields:
-            if field not in v:
-                raise ValueError(f'Missing required field in shipping address: {field}')
-        return v
-    
-    @validator('payment_method')
-    def validate_payment_method(cls, v):
-        valid_methods = ['credit_card', 'debit_card', 'paypal', 'upi', 'cod']
-        if v.lower() not in valid_methods:
-            raise ValueError(f'Invalid payment method. Must be one of: {valid_methods}')
-        return v.lower()
 
 class OrderItemResponse(BaseModel):
     product_id: str
@@ -218,20 +384,6 @@ class UpdateOrderStatusRequest(BaseModel):
             raise ValueError(f'Invalid status. Must be one of: {valid_statuses}')
         return v.lower()
 
-# Helper functions
-def serialize_doc(doc):
-    """Convert ObjectId to string for JSON serialization"""
-    if doc is None:
-        return None
-    doc["_id"] = str(doc["_id"])
-    return doc
-
-async def get_database():
-    """Dependency to get database instance"""
-    if database is None:
-        raise HTTPException(status_code=503, detail="Database connection not available. Please check your MongoDB connection.")
-    return database
-
 async def product_exists(product_id: str, db) -> dict:
     """Check if product exists and return it"""
     if not ObjectId.is_valid(product_id):
@@ -243,162 +395,11 @@ async def product_exists(product_id: str, db) -> dict:
     
     return product
 
-# API Endpoints
+# Additional endpoints (these are not required for HROne task but kept from your original code)
 
-@app.get("/", tags=["Root"])
-async def root():
-    """Root endpoint - Always accessible"""
-    return {
-        "message": "Welcome to Ecommerce API", 
-        "version": "1.0.0",
-        "docs": "/docs",
-        "health": "/health",
-        "status": "running",
-        "timestamp": datetime.utcnow().isoformat()
-    }
-
-@app.get("/health", tags=["Health"])
-async def health_check():
-    """Health check endpoint - Always accessible"""
-    try:
-        # Test database connection
-        if database is not None:
-            await database.command('ping')
-            db_status = "connected"
-        else:
-            db_status = "disconnected"
-    except Exception as e:
-        db_status = f"error: {str(e)}"
-    
-    return {
-        "status": "healthy",
-        "database": db_status,
-        "timestamp": datetime.utcnow().isoformat(),
-        "version": "1.0.0"
-    }
-
-@app.post("/products", status_code=201, response_model=ProductResponse, tags=["Products"])
-async def create_product(product: CreateProductRequest, db=Depends(get_database)):
-    """Create a new product"""
-    try:
-        # Check if product with same name already exists
-        existing_product = await db.products.find_one({"name": {"$regex": f"^{re.escape(product.name)}$", "$options": "i"}})
-        if existing_product:
-            raise HTTPException(status_code=400, detail="Product with this name already exists")
-        
-        # Convert attributes to dictionary format for MongoDB
-        attributes_dict = {attr.name: attr.value for attr in product.attributes}
-        
-        product_doc = {
-            "name": product.name,
-            "description": product.description,
-            "price": product.price,
-            "category": product.category,
-            "brand": product.brand,
-            "attributes": attributes_dict,
-            "stock_quantity": product.stock_quantity,
-            "images": product.images,
-            "created_at": datetime.utcnow(),
-            "updated_at": datetime.utcnow()
-        }
-        
-        result = await db.products.insert_one(product_doc)
-        
-        # Fetch the created product
-        created_product = await db.products.find_one({"_id": result.inserted_id})
-        
-        # Convert attributes back to list format for response
-        if created_product:
-            created_product["attributes"] = [
-                ProductAttribute(name=k, value=v) 
-                for k, v in created_product["attributes"].items()
-            ]
-            
-        logger.info(f"Product created: {created_product['name']} (ID: {result.inserted_id})")
-        return ProductResponse(**serialize_doc(created_product))
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to create product: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to create product: {str(e)}")
-
-@app.get("/products", status_code=200, response_model=ProductsListResponse, tags=["Products"])
-async def list_products(
-    name: Optional[str] = Query(None, description="Filter by product name (supports partial matching)"),
-    category: Optional[str] = Query(None, description="Filter by category"),
-    brand: Optional[str] = Query(None, description="Filter by brand"),
-    size: Optional[str] = Query(None, description="Filter by size attribute"),
-    min_price: Optional[float] = Query(None, ge=0, description="Minimum price filter"),
-    max_price: Optional[float] = Query(None, gt=0, description="Maximum price filter"),
-    in_stock: Optional[bool] = Query(None, description="Filter products in stock"),
-    limit: int = Query(10, ge=1, le=100, description="Number of products to return"),
-    offset: int = Query(0, ge=0, description="Number of products to skip"),
-    db=Depends(get_database)
-):
-    """List products with optional filtering and pagination"""
-    try:
-        # Build filter query
-        filter_query = {}
-        
-        if name:
-            filter_query["name"] = {"$regex": re.escape(name), "$options": "i"}
-        
-        if category:
-            filter_query["category"] = {"$regex": re.escape(category), "$options": "i"}
-            
-        if brand:
-            filter_query["brand"] = {"$regex": re.escape(brand), "$options": "i"}
-        
-        if size:
-            filter_query["attributes.size"] = size
-            
-        if min_price is not None or max_price is not None:
-            price_filter = {}
-            if min_price is not None:
-                price_filter["$gte"] = min_price
-            if max_price is not None:
-                price_filter["$lte"] = max_price
-            filter_query["price"] = price_filter
-            
-        if in_stock is True:
-            filter_query["stock_quantity"] = {"$gt": 0}
-        elif in_stock is False:
-            filter_query["stock_quantity"] = {"$eq": 0}
-        
-        # Get total count for pagination info
-        total_count = await db.products.count_documents(filter_query)
-        
-        # Fetch products with pagination
-        cursor = db.products.find(filter_query).skip(offset).limit(limit).sort("created_at", -1)
-        products = await cursor.to_list(length=limit)
-        
-        # Convert attributes back to list format for response
-        product_responses = []
-        for product in products:
-            product["attributes"] = [
-                ProductAttribute(name=k, value=v) 
-                for k, v in product.get("attributes", {}).items()
-            ]
-            product_responses.append(ProductResponse(**serialize_doc(product)))
-        
-        has_more = offset + limit < total_count
-        
-        return ProductsListResponse(
-            products=product_responses,
-            total_count=total_count,
-            limit=limit,
-            offset=offset,
-            has_more=has_more
-        )
-        
-    except Exception as e:
-        logger.error(f"Failed to fetch products: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch products: {str(e)}")
-
-@app.get("/products/{product_id}", status_code=200, response_model=ProductResponse, tags=["Products"])
+@app.get("/products/{product_id}", status_code=200, response_model=ProductResponse, tags=["Products - Extra"])
 async def get_product(product_id: str, db=Depends(get_database)):
-    """Get a specific product by ID"""
+    """Get a specific product by ID - Extra endpoint"""
     try:
         product = await product_exists(product_id, db)
         
@@ -416,9 +417,9 @@ async def get_product(product_id: str, db=Depends(get_database)):
         logger.error(f"Failed to fetch product {product_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch product: {str(e)}")
 
-@app.put("/products/{product_id}", status_code=200, response_model=ProductResponse, tags=["Products"])
+@app.put("/products/{product_id}", status_code=200, response_model=ProductResponse, tags=["Products - Extra"])
 async def update_product(product_id: str, product_update: UpdateProductRequest, db=Depends(get_database)):
-    """Update a product"""
+    """Update a product - Extra endpoint"""
     try:
         # Check if product exists
         await product_exists(product_id, db)
@@ -467,9 +468,9 @@ async def update_product(product_id: str, product_update: UpdateProductRequest, 
         logger.error(f"Failed to update product {product_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to update product: {str(e)}")
 
-@app.delete("/products/{product_id}", status_code=204, tags=["Products"])
+@app.delete("/products/{product_id}", status_code=204, tags=["Products - Extra"])
 async def delete_product(product_id: str, db=Depends(get_database)):
-    """Delete a product"""
+    """Delete a product - Extra endpoint"""
     try:
         # Check if product exists
         await product_exists(product_id, db)
@@ -489,114 +490,9 @@ async def delete_product(product_id: str, db=Depends(get_database)):
         logger.error(f"Failed to delete product {product_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to delete product: {str(e)}")
 
-@app.post("/orders", status_code=201, response_model=OrderResponse, tags=["Orders"])
-async def create_order(order: CreateOrderRequest, db=Depends(get_database)):
-    """Create a new order"""
-    try:
-        # Validate products exist and calculate total
-        total_amount = 0.0
-        order_items = []
-        
-        for item in order.items:
-            # Verify product exists
-            product = await product_exists(item.product_id, db)
-            
-            # Check stock availability
-            if product["stock_quantity"] < item.quantity:
-                raise HTTPException(
-                    status_code=400, 
-                    detail=f"Insufficient stock for product {item.product_id}. Available: {product['stock_quantity']}, Requested: {item.quantity}"
-                )
-            
-            # Use product's current price if not provided
-            price_per_item = item.price_per_item if item.price_per_item is not None else product["price"]
-            item_total = price_per_item * item.quantity
-            total_amount += item_total
-            
-            order_items.append({
-                "product_id": item.product_id,
-                "product_name": product["name"],
-                "quantity": item.quantity,
-                "price_per_item": price_per_item,
-                "total_price": item_total
-            })
-        
-        # Create order document
-        order_doc = {
-            "user_id": order.user_id,
-            "items": order_items,
-            "total_amount": total_amount,
-            "shipping_address": order.shipping_address,
-            "payment_method": order.payment_method,
-            "status": "pending",
-            "created_at": datetime.utcnow(),
-            "updated_at": datetime.utcnow()
-        }
-        
-        result = await db.orders.insert_one(order_doc)
-        
-        # Update stock quantities
-        for item in order.items:
-            await db.products.update_one(
-                {"_id": ObjectId(item.product_id)},
-                {
-                    "$inc": {"stock_quantity": -item.quantity},
-                    "$set": {"updated_at": datetime.utcnow()}
-                }
-            )
-        
-        # Fetch the created order
-        created_order = await db.orders.find_one({"_id": result.inserted_id})
-        
-        logger.info(f"Order created: {result.inserted_id} for user {order.user_id}")
-        return OrderResponse(**serialize_doc(created_order))
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to create order: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to create order: {str(e)}")
-
-@app.get("/orders/{user_id}", status_code=200, response_model=OrdersListResponse, tags=["Orders"])
-async def get_user_orders(
-    user_id: str,
-    status: Optional[str] = Query(None, description="Filter by order status"),
-    limit: int = Query(10, ge=1, le=100, description="Number of orders to return"),
-    offset: int = Query(0, ge=0, description="Number of orders to skip"),
-    db=Depends(get_database)
-):
-    """Get list of orders for a specific user"""
-    try:
-        filter_query = {"user_id": user_id}
-        
-        if status:
-            filter_query["status"] = status.lower()
-        
-        # Get total count for pagination info
-        total_count = await db.orders.count_documents(filter_query)
-        
-        # Fetch orders with pagination (sorted by created_at descending)
-        cursor = db.orders.find(filter_query).sort("created_at", -1).skip(offset).limit(limit)
-        orders = await cursor.to_list(length=limit)
-        
-        order_responses = [OrderResponse(**serialize_doc(order)) for order in orders]
-        has_more = offset + limit < total_count
-        
-        return OrdersListResponse(
-            orders=order_responses,
-            total_count=total_count,
-            limit=limit,
-            offset=offset,
-            has_more=has_more
-        )
-        
-    except Exception as e:
-        logger.error(f"Failed to fetch orders for user {user_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch orders: {str(e)}")
-
-@app.get("/orders/detail/{order_id}", status_code=200, response_model=OrderResponse, tags=["Orders"])
+@app.get("/orders/detail/{order_id}", status_code=200, response_model=OrderResponse, tags=["Orders - Extra"])
 async def get_order(order_id: str, db=Depends(get_database)):
-    """Get a specific order by ID"""
+    """Get a specific order by ID - Extra endpoint"""
     try:
         if not ObjectId.is_valid(order_id):
             raise HTTPException(status_code=400, detail="Invalid order ID format")
@@ -613,9 +509,9 @@ async def get_order(order_id: str, db=Depends(get_database)):
         logger.error(f"Failed to fetch order {order_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch order: {str(e)}")
 
-@app.patch("/orders/{order_id}/status", status_code=200, response_model=OrderResponse, tags=["Orders"])
+@app.patch("/orders/{order_id}/status", status_code=200, response_model=OrderResponse, tags=["Orders - Extra"])
 async def update_order_status(order_id: str, status_update: UpdateOrderStatusRequest, db=Depends(get_database)):
-    """Update order status"""
+    """Update order status - Extra endpoint"""
     try:
         if not ObjectId.is_valid(order_id):
             raise HTTPException(status_code=400, detail="Invalid order ID format")
