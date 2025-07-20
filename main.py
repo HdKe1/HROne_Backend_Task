@@ -36,12 +36,14 @@ async def lifespan(app: FastAPI):
         # Create MongoDB client with more robust connection settings
         client = AsyncIOMotorClient(
             MONGODB_URL,
-            ssl_cert_reqs=ssl.CERT_NONE,
-            ssl_match_hostname=False,
-            serverSelectionTimeoutMS=5000,  # 5 second timeout
-            connectTimeoutMS=5000,
+            serverSelectionTimeoutMS=30000,  # Increased to 30 seconds
+            connectTimeoutMS=30000,          # Increased to 30 seconds
+            socketTimeoutMS=30000,           # Increased to 30 seconds
             maxPoolSize=10,
-            retryWrites=True
+            minPoolSize=1,
+            retryWrites=True,
+            # Add DNS resolution timeout
+            directConnection=False,
         )
         database = client[DATABASE_NAME]
         
@@ -55,7 +57,7 @@ async def lifespan(app: FastAPI):
             # This prevents 404 errors on basic endpoints
         
         # Create indexes for better performance (only if database is connected)
-        if database:
+        if database is not None:
             try:
                 await database.products.create_index("name")
                 await database.products.create_index("category")
@@ -77,7 +79,7 @@ async def lifespan(app: FastAPI):
     
     # Shutdown
     try:
-        if client:
+        if client is not None:
             client.close()
             logger.info("🔌 MongoDB connection closed")
     except Exception as e:
@@ -260,7 +262,7 @@ async def health_check():
     """Health check endpoint - Always accessible"""
     try:
         # Test database connection
-        if database:
+        if database is not None:
             await database.command('ping')
             db_status = "connected"
         else:
